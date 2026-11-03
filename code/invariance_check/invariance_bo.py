@@ -6,7 +6,9 @@ acquisition value at its argmax -> proposed point. The 90 cases (arm, seed, a, b
 the reference for each (arm, seed) is its own a = 1, b = 0 case.
 
 Outputs in results/invariance/: bo.csv (one row per case), bo_diffs.csv (|difference| to the reference
-per case, stage and iteration), first_divergence_bo.png and divergence_growth_bo.png.
+per case, stage and iteration), bo_gaps.csv (gap in best untransformed f, with the seed null band),
+bo_curves.csv (best-so-far untransformed f after every evaluation, for the figure), first_divergence_bo.png,
+divergence_growth_bo.png and best_so_far_bo.png.
 """
 import warnings
 from concurrent.futures import ProcessPoolExecutor
@@ -25,7 +27,7 @@ from botorch.optim import optimize_acqf
 from botorch.utils.sampling import draw_sobol_samples
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
-from invariance_util import A_VALS, B_VALS, BOX, RESULTS, SEEDS, compare, diffs, make_problem, plot_first_divergence, write_csv
+from invariance_util import A_VALS, B_VALS, BOX, RESULTS, SEEDS, best_so_far, compare, diffs, log_gap, make_problem, plot_best_so_far, plot_first_divergence, summarise_gaps, write_csv
 
 warnings.filterwarnings("ignore", category=NumericsWarning)  # BoTorch warns on every EI construction; the EI arm is deliberate
 
@@ -40,7 +42,8 @@ def run_bo(f, seed, acq_class, d=2):
 
     Returns a dict with one list per stage in STAGES, each holding one entry per iteration:
     data (standardised Y), hyper (raw GP parameters), acq (value at the argmax), proposal (the point);
-    plus retries, how often BoTorch restarted the acquisition optimiser after scipy reported failure.
+    plus retries, how often BoTorch restarted the acquisition optimiser after scipy reported failure,
+    and X, every evaluated point in order (initial design first).
     """
     bounds = torch.tensor([[BOX[0]] * d, [BOX[1]] * d], dtype=torch.double)
     X = draw_sobol_samples(bounds, n=BO_INIT, q=1, seed=seed).squeeze(1)  # same initial design for every (a, b)
@@ -63,6 +66,7 @@ def run_bo(f, seed, acq_class, d=2):
         log["retries"].append(sum("Trying again" in str(w.message) for w in caught))
         X = torch.cat([X, x_next])
         Y = torch.cat([Y, torch.tensor([[-f(x_next)]], dtype=torch.double)])
+    log["X"] = X.numpy()
     return log
 
 
@@ -80,12 +84,14 @@ def rescaled_acq(acq_values, acq_name, a):
 
 
 def experiment_bo():
-    """Both arms, every seed and (a, b). Returns (rows, diff_rows).
+    """Both arms, every seed and (a, b). Returns (rows, diff_rows, curve_rows).
 
     rows: one per case with first_div (earliest iteration where any stage differs from the reference by
     more than TOL, None if never), first_stage (earliest stage in cascade order differing at that
-    iteration), steps, retries and max_diff_<stage>.
+    iteration), steps, retries, max_diff_<stage>, best_f (best untransformed f at the end of the budget)
+    and gap (its log10 difference to the reference run of the same seed).
     diff_rows: one per case, stage and iteration with the raw |difference| to the reference.
+    curve_rows: one per case and evaluation with the best-so-far untransformed f.
     """
     cases = [(acq, seed, a, b) for acq in ACQUISITIONS for seed in SEEDS for a in A_VALS for b in B_VALS]
     with ProcessPoolExecutor() as pool:
@@ -93,20 +99,25 @@ def experiment_bo():
     for (acq_name, _, a, _), log in logs.items():
         log["acq"] = rescaled_acq(log["acq"], acq_name, a)
 
-    rows, diff_rows = [], []
+    rows, diff_rows, curve_rows = [], [], []
     for (acq_name, seed, a, b), log in logs.items():
         ref = logs[acq_name, seed, 1, 0]
+        f = make_problem(d := log["X"].shape[1], seed)  # untransformed f, as the rules require
+        curve = best_so_far(f, log["X"])
+        best, ref_best = curve[-1], best_so_far(f, ref["X"])[-1]
+        curve_rows += [{"acq": acq_name, "seed": seed, "a": a, "b": b, "eval": i + 1, "best_f": v} for i, v in enumerate(curve)]
         first = {stage: compare(log[stage], ref[stage], TOL) for stage in STAGES}
         first_it = min((it for it, _ in first.values() if it is not None), default=None)
         first_stage = None if first_it is None else next(stage for stage in STAGES if first[stage][0] == first_it)
         rows.append({"acq": acq_name, "seed": seed, "a": a, "b": b,
                      "first_div": first_it, "first_stage": first_stage,
                      "steps": len(log["acq"]), "retries": sum(log["retries"]),
+                     "best_f": best, "gap": log_gap(best, ref_best),
                      **{f"max_diff_{stage}": max_diff for stage, (_, max_diff) in first.items()}})
         for stage in STAGES:
             for it, diff in enumerate(diffs(log[stage], ref[stage])):
                 diff_rows.append({"acq": acq_name, "seed": seed, "a": a, "b": b, "stage": stage, "it": it, "diff": diff})
-    return rows, diff_rows
+    return rows, diff_rows, curve_rows
 
 
 def plot_divergence_growth(diff_rows, path, stage="proposal"):
@@ -133,9 +144,12 @@ def plot_divergence_growth(diff_rows, path, stage="proposal"):
 
 if __name__ == "__main__":
     RESULTS.mkdir(parents=True, exist_ok=True)
-    rows, diff_rows = experiment_bo()
+    rows, diff_rows, curve_rows = experiment_bo()
     write_csv(rows, RESULTS / "bo.csv")
     write_csv(diff_rows, RESULTS / "bo_diffs.csv")
+    write_csv(curve_rows, RESULTS / "bo_curves.csv")
+    write_csv(summarise_gaps(rows, ("acq", "a", "b")), RESULTS / "bo_gaps.csv")
     plot_first_divergence({f"BO {acq}, d = 2": [r for r in rows if r["acq"] == acq] for acq in ACQUISITIONS},
                           RESULTS / "first_divergence_bo.png")
     plot_divergence_growth(diff_rows, RESULTS / "divergence_growth_bo.png")
+    plot_best_so_far(curve_rows, RESULTS / "best_so_far_bo.png", col="a", line="b", row="acq", ref={"a": 1, "b": 0})

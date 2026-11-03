@@ -2,12 +2,13 @@
 
 A1: termination off, 2000 evaluations; compare the mean and sigma of every generation with the reference.
 A2: default termination; record the stopping generation and reason.
-Outputs results/invariance/cma.csv and first_divergence_cma.png.
+Outputs results/invariance/cma.csv, cma_gaps.csv (gap in best untransformed f, with the seed null band),
+cma_curves.csv (best-so-far untransformed f after every evaluation, for the figure), first_divergence_cma.png and best_so_far_cma.png.
 """
 import cma
 import numpy as np
 
-from invariance_util import A_VALS, B_VALS, BOX, RESULTS, SEEDS, compare, make_problem, plot_first_divergence, write_csv
+from invariance_util import A_VALS, B_VALS, BOX, RESULTS, SEEDS, best_so_far, compare, log_gap, make_problem, plot_best_so_far, plot_first_divergence, summarise_gaps, write_csv
 
 CMA_BUDGET = 2000
 SIGMA0 = 2.5
@@ -17,8 +18,9 @@ NO_TERMINATION = {"tolfun": 0, "tolfunhist": 0}
 def run_cma(f, seed, d=5, opts=None, use_stop=False):
     """Run pycma on f for CMA_BUDGET evaluations, or until es.stop() if use_stop.
 
-    Returns (means, sigmas, stop): the mean and step size after every generation as arrays of
-    shape (generations, d) and (generations,), and the final es.stop() dict.
+    Returns (means, sigmas, stop, X): the mean and step size after every generation as arrays of
+    shape (generations, d) and (generations,), the final es.stop() dict, and every evaluated point
+    in evaluation order as an array of shape (evaluations, d).
     """
     x0 = np.random.default_rng(seed).uniform(*BOX, d)
     options = {
@@ -30,7 +32,7 @@ def run_cma(f, seed, d=5, opts=None, use_stop=False):
     options.update(opts or {})
     es = cma.CMAEvolutionStrategy(x0, SIGMA0, options)
 
-    means, sigmas = [], []
+    means, sigmas, points = [], [], []
     while es.countevals < CMA_BUDGET:
         if use_stop and es.stop():
             break
@@ -39,36 +41,50 @@ def run_cma(f, seed, d=5, opts=None, use_stop=False):
         # es.mean lives in an unbounded internal space; xfavorite is that mean folded into the box
         means.append(es.result.xfavorite.copy())
         sigmas.append(es.sigma)
-    return np.array(means), np.array(sigmas), dict(es.stop())
+        points.extend(X)
+    return np.array(means), np.array(sigmas), dict(es.stop()), np.array(points)
 
 
 def experiment_cma(d=5):
-    """A1 and A2 for every seed and (a, b). Returns one row per case.
+    """A1 and A2 for every seed and (a, b). Returns (rows, curve_rows): one row per case, and one row per
+    case, arm (budget = A1, stop = A2) and evaluation with the best-so-far untransformed f.
 
     Columns: first_div (earliest generation where mean or sigma differs bit-for-bit from the reference,
-    None if never), steps (generations run), max_diff_mean, max_diff_sigma, stop_gen and stop_reason (A2).
+    None if never), steps (generations run), max_diff_mean, max_diff_sigma, stop_gen and stop_reason (A2),
+    best_f / best_f_stop (best untransformed f at the end of A1 / at the A2 stop) and gap / gap_stop
+    (their log10 difference to the reference run of the same seed).
     """
-    rows = []
+    rows, curve_rows = [], []
     for seed in SEEDS:
         f = make_problem(d, seed)
-        ref_means, ref_sigmas, _ = run_cma(f, seed, d, opts=NO_TERMINATION)
+        ref_means, ref_sigmas, _, ref_X = run_cma(f, seed, d, opts=NO_TERMINATION)
+        ref_best, ref_best_stop = best_so_far(f, ref_X)[-1], best_so_far(f, run_cma(f, seed, d, use_stop=True)[3])[-1]
         for a in A_VALS:
             for b in B_VALS:
                 g = lambda x: a * f(x) + b  # what the optimiser sees
-                means, sigmas, _ = run_cma(g, seed, d, opts=NO_TERMINATION)  # A1
-                _, stopped_sigmas, stop = run_cma(g, seed, d, use_stop=True)  # A2
+                means, sigmas, _, X = run_cma(g, seed, d, opts=NO_TERMINATION)  # A1
+                _, stopped_sigmas, stop, X_stop = run_cma(g, seed, d, use_stop=True)  # A2
+                curve, curve_stop = best_so_far(f, X), best_so_far(f, X_stop)  # untransformed f, as the rules require
+                best, best_stop = curve[-1], curve_stop[-1]
+                for arm, cv in (("budget", curve), ("stop", curve_stop)):
+                    curve_rows += [{"seed": seed, "a": a, "b": b, "arm": arm, "eval": i + 1, "best_f": v} for i, v in enumerate(cv)]
                 first_mean, max_mean = compare(means, ref_means)
                 first_sigma, max_sigma = compare(sigmas, ref_sigmas)
                 firsts = [i for i in (first_mean, first_sigma) if i is not None]
                 rows.append({"seed": seed, "a": a, "b": b,
                              "first_div": min(firsts, default=None), "steps": len(means),
                              "max_diff_mean": max_mean, "max_diff_sigma": max_sigma,
-                             "stop_gen": len(stopped_sigmas), "stop_reason": ", ".join(stop)})
-    return rows
+                             "stop_gen": len(stopped_sigmas), "stop_reason": ", ".join(stop),
+                             "best_f": best, "gap": log_gap(best, ref_best),
+                             "best_f_stop": best_stop, "gap_stop": log_gap(best_stop, ref_best_stop)})
+    return rows, curve_rows
 
 
 if __name__ == "__main__":
     RESULTS.mkdir(parents=True, exist_ok=True)
-    rows = experiment_cma()
+    rows, curve_rows = experiment_cma()
     write_csv(rows, RESULTS / "cma.csv")
+    write_csv(curve_rows, RESULTS / "cma_curves.csv")
+    write_csv(summarise_gaps(rows, ("a", "b")) + summarise_gaps(rows, ("a", "b"), "gap_stop"), RESULTS / "cma_gaps.csv")
     plot_first_divergence({"CMA-ES, d = 5": rows}, RESULTS / "first_divergence_cma.png")
+    plot_best_so_far(curve_rows, RESULTS / "best_so_far_cma.png", col="a", line="b", row="arm", ref={"a": 1, "b": 0})
