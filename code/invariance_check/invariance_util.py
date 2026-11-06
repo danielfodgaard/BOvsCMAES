@@ -117,7 +117,7 @@ def plot_best_so_far(curve_rows, path, col, line, row=None, ref=None, label=None
     axes[0, 0].legend(frameon=False)
     fig.supxlabel("evaluations")
     fig.supylabel("best-so-far untransformed f, median over seeds")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.02, 0.02, 1, 1))  # tight_layout ignores the sup-labels; reserve a margin so they clear the ticks
     fig.savefig(path, dpi=150)
 
 

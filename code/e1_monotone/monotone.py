@@ -3,7 +3,9 @@
 Every method runs on g(f) for each g in TRANSFORMS with the same seed, start point and initial design as on f.
 CMA-ES uses H1's runner: A1 has f-based termination off and a fixed budget, and is compared bit for bit with
 the run on f; A2 uses pycma's default termination, whose thresholds are absolute differences in g.
-BO uses H1's runner with LogEI: the default arm fits the GP to g(f), the rank arm to the ranks of g(f) (Shirakawa).
+BO uses H1's runner with LogEI: the default arm fits the GP to g(f), the rank arm to the ranks of g(f) (Shirakawa),
+the low-noise arm is the default with BoTorch's noise floor lowered from 1e-4 to NOISE_FLOOR (on f, the default floor
+is a noise std of about 6 in f units, 80x the best f reached).
 Always scored on the untransformed f: gap = log10 best f on g - log10 best f on f, same seed and arm.
 
 Outputs in results/e1_monotone/: cma.csv and bo.csv (one row per run), gaps.csv (median and max |gap| per
@@ -29,10 +31,12 @@ from invariance_cma import NO_TERMINATION, run_cma
 from invariance_util import best_so_far, compare, log_gap, make_problem, plot_best_so_far, summarise_gaps, write_csv
 
 D, SEEDS = 5, range(10)
-BO_BUDGET = 100
+BO_BUDGET = 90  # 10 Sobol + 80 iterations; was 100, cut for runtime (the last fits are the costliest, GP fit is O(n^3))
 POPSIZE = 8  # set in run_cma; CMA curves are saved once per generation to keep the CSV small
 C_SAT = 100  # about the 1 % quantile of f over the box, so g > 0.5 on 99 % of it
+NOISE_FLOOR = 1e-8  # noise variance bound for the low-noise arm, standardised units: noise std 1e-4 of the spread
 TRANSFORMS = {  # g applied to f >= 0; every one is strictly increasing
+    "log f": lambda v: np.log(max(v, 1e-300)),  # the usual real-world transform; floor only guards f == 0 exactly
     "f^0.25": lambda v: v**0.25,
     "f^0.5": lambda v: v**0.5,
     "f^1": lambda v: v,
@@ -42,7 +46,7 @@ TRANSFORMS = {  # g applied to f >= 0; every one is strictly increasing
     "1000f": lambda v: 1000 * v,  # affine control (H1): same problem in exact arithmetic, so its gap is the rounding-only null
 }
 REF = "f^1"
-BO_ARMS = ["bo_default", "bo_rank"]
+BO_ARMS = ["bo_default", "bo_rank", "bo_lownoise"]
 RESULTS = Path(__file__).parents[2] / "results" / "e1_monotone"
 
 
@@ -50,8 +54,8 @@ def experiment_cma():
     """A1 and A2 for every seed and transform. Returns (rows, curve_rows).
 
     rows: first_div (earliest generation where mean or sigma differs bit for bit from the run on f, None if
-    never), max_diff_mean/sigma, best_f and gap after the full budget (A1), best_f_at_bo_budget (A1 after
-    BO_BUDGET evaluations), stop_evals, stop_reason, best_f_stop and gap_stop (A2).
+    never), max_diff_mean/sigma, best_f and gap after the full budget (A1), stop_evals, stop_reason,
+    best_f_stop and gap_stop (A2).
     """
     rows, curve_rows = [], []
     for seed in SEEDS:
@@ -67,7 +71,7 @@ def experiment_cma():
             rows.append({"method": "cma", "seed": seed, "transform": name,
                          "first_div": min((i for i in (first_mean, first_sigma) if i is not None), default=None),
                          "max_diff_mean": max_mean, "max_diff_sigma": max_sigma,
-                         "best_f": curve[-1], "gap": log_gap(curve[-1], ref_best), "best_f_at_bo_budget": curve[BO_BUDGET - 1],
+                         "best_f": curve[-1], "gap": log_gap(curve[-1], ref_best),
                          "stop_evals": len(X_stop), "stop_reason": ", ".join(stop) or "budget",
                          "best_f_stop": curve_stop[-1], "gap_stop": log_gap(curve_stop[-1], ref_best_stop)})
             for arm, cv in (("budget", curve), ("stop", curve_stop)):
@@ -80,7 +84,8 @@ def run_case(method, seed, name):
     """One BO run on g(f). Top level so a worker process can run it."""
     torch.set_num_threads(1)  # tiny problems: many single-threaded runs in parallel beat one multi-threaded run
     f, g = make_problem(D, seed), TRANSFORMS[name]
-    return run_bo(lambda x: g(f(x)), seed, LogExpectedImprovement, D, BO_BUDGET, rank=method == "bo_rank")
+    return run_bo(lambda x: g(f(x)), seed, LogExpectedImprovement, D, BO_BUDGET, rank=method == "bo_rank",
+                  noise_floor=NOISE_FLOOR if method == "bo_lownoise" else None)
 
 
 def experiment_bo():
@@ -116,6 +121,7 @@ def experiment_bo():
 ARMS = {  # (method, gap key): legend label, fixed categorical slot, marker as the second encoding
     ("bo_default", "gap"): ("BO, default", "#2a78d6", "o"),
     ("bo_rank", "gap"): ("BO, ranks", "#eb6834", "s"),
+    ("bo_lownoise", "gap"): ("BO, low noise floor", "#8e5bd6", "v"),
     ("cma", "gap"): ("CMA-ES, fixed budget", "#1baf7a", "^"),
     ("cma", "gap_stop"): ("CMA-ES, default stopping", "#eda100", "D"),
 }
@@ -141,25 +147,19 @@ def _strip(ax, names, arms, values):
 
 
 def plot_gap(rows, path):
-    """Left: paired gap per transform and arm. Middle: best untransformed f after BO_BUDGET evaluations.
-    Right: evaluations CMA-ES with default stopping uses before it stops."""
+    """Left: paired gap per transform and arm. Right: evaluations CMA-ES with default stopping uses before it stops.
+    No absolute-level panel: BO's 100 and CMA-ES's 2000 evaluations are different regimes, so only paired gaps compare."""
     by = lambda method, name: [r for r in rows if r["method"] == method and r["transform"] == name]
     names = list(TRANSFORMS)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), gridspec_kw={"width_ratios": [1.3, 1.3, 0.8]})
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), gridspec_kw={"width_ratios": [1.6, 1]})
 
     others = [n for n in names if n != REF]
     axes[0].axhline(0, color="#8a8984", linewidth=1)
     _strip(axes[0], others, list(ARMS), lambda arm, name: [r[arm[1]] for r in by(arm[0], name)])
     _style(axes[0], others, "log10 best f on g − log10 best f on f", "Paired gap (0 = invariant; > 0 = worse on g)")
 
-    level_arms = [("bo_default", "gap"), ("bo_rank", "gap"), ("cma", "gap")]
-    key = lambda arm: "best_f_at_bo_budget" if arm[0] == "cma" else "best_f"
-    _strip(axes[1], names, level_arms, lambda arm, name: [r[key(arm)] for r in by(arm[0], name)])
-    axes[1].set_yscale("log")
-    _style(axes[1], names, "best untransformed f", f"Best f after {BO_BUDGET} evaluations (CMA-ES: fixed-budget run)")
-
-    _strip(axes[2], names, [("cma", "gap_stop")], lambda arm, name: [r["stop_evals"] for r in by("cma", name)])
-    _style(axes[2], names, "evaluations used before stopping", "CMA-ES, default stopping")
+    _strip(axes[1], names, [("cma", "gap_stop")], lambda arm, name: [r["stop_evals"] for r in by("cma", name)])
+    _style(axes[1], names, "evaluations used before stopping", "CMA-ES, default stopping")
 
     for ax in axes:
         ax.legend(frameon=False, fontsize=8)
@@ -175,18 +175,18 @@ def plot_gp_fit(bo_rows, path):
     """
     names = list(TRANSFORMS)
     ramp = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]  # dimension 1 (weight 1) light -> 5 (weight 100) dark
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.4), sharex=True)
-    for ax, method in zip(axes[:2], BO_ARMS):
+    fig, axes = plt.subplots(1, len(BO_ARMS) + 1, figsize=(5.3 * (len(BO_ARMS) + 1), 4.4), sharex=True)
+    for ax, method in zip(axes, BO_ARMS):
         for j, color in enumerate(ramp):
             med = [np.median([r[f"ls{j + 1}_final"] for r in bo_rows if r["method"] == method and r["transform"] == n]) for n in names]
             ax.plot(range(len(names)), med, color=color, marker="o", markersize=6, linewidth=2, label=f"dim {j + 1}")
         ax.set_yscale("log")
         _style(ax, names, "lengthscale (normalised inputs)", f"{ARMS[method, 'gap'][0]}: last GP's lengthscales, median")
-    _strip(axes[2], names, [("bo_default", "gap"), ("bo_rank", "gap")],
+    _strip(axes[-1], names, [(m, "gap") for m in BO_ARMS],
            lambda arm, name: [r["noise_final"] for r in bo_rows if r["method"] == arm[0] and r["transform"] == name])
-    axes[2].set_yscale("log")
-    _style(axes[2], names, "noise variance (standardised outputs)", "Last GP's fitted noise")
-    axes[2].legend(frameon=False, fontsize=8)
+    axes[-1].set_yscale("log")
+    _style(axes[-1], names, "noise variance (standardised outputs)", "Last GP's fitted noise")
+    axes[-1].legend(frameon=False, fontsize=8)
     fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncols=5, frameon=False, fontsize=8)
     fig.tight_layout(rect=(0, 0.06, 1, 1))
     fig.savefig(path, dpi=150)
