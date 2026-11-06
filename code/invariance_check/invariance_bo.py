@@ -25,7 +25,11 @@ from botorch.models import SingleTaskGP
 from botorch.models.transforms import Normalize
 from botorch.optim import optimize_acqf
 from botorch.utils.sampling import draw_sobol_samples
+from gpytorch.constraints import GreaterThan
+from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
+from gpytorch.priors import LogNormalPrior
+from scipy.stats import rankdata
 
 from invariance_util import A_VALS, B_VALS, BOX, RESULTS, SEEDS, best_so_far, compare, diffs, log_gap, make_problem, plot_best_so_far, plot_first_divergence, summarise_gaps, write_csv
 
@@ -37,24 +41,36 @@ STAGES = ["data", "hyper", "acq", "proposal"]
 TOL = 1e-6  # the GP fitter itself is only reproducible to ~1e-9; below TOL counts as agreement, raw diffs are saved anyway
 
 
-def run_bo(f, seed, acq_class, d=2):
+def run_bo(f, seed, acq_class, d=2, budget=BO_BUDGET, rank=False, noise_floor=None):
     """BO on -f (BoTorch maximises) with SingleTaskGP defaults, i.e. standardised outcomes.
 
     Returns a dict with one list per stage in STAGES, each holding one entry per iteration:
     data (standardised Y), hyper (raw GP parameters), acq (value at the argmax), proposal (the point);
     plus retries, how often BoTorch restarted the acquisition optimiser after scipy reported failure,
+    lengthscale and noise (fitted GP values, normalised-input and standardised-output units),
     and X, every evaluated point in order (initial design first).
+    rank=True fits the GP to the ranks of the observed values instead of the values (Shirakawa's fix),
+    which makes the run invariant to any strictly increasing transform of f.
+    noise_floor lowers BoTorch's bound on the fitted noise variance (default 1e-4, in standardised-output units,
+    i.e. 1 % of the spread of the observed values as noise std); the LogNormal(-4, 1) prior on it is kept.
     """
+    def likelihood():  # fresh per fit, like BoTorch's default; None keeps the default
+        if noise_floor is None:
+            return None
+        prior = LogNormalPrior(loc=-4.0, scale=1.0)  # BoTorch's default prior, so only the bound changes
+        return GaussianLikelihood(noise_prior=prior, noise_constraint=GreaterThan(noise_floor, transform=None, initial_value=prior.mode))
     bounds = torch.tensor([[BOX[0]] * d, [BOX[1]] * d], dtype=torch.double)
     X = draw_sobol_samples(bounds, n=BO_INIT, q=1, seed=seed).squeeze(1)  # same initial design for every (a, b)
     Y = torch.tensor([[-f(x)] for x in X], dtype=torch.double)
-    log = {stage: [] for stage in STAGES + ["retries"]}
-    while len(X) < BO_BUDGET:
+    log = {stage: [] for stage in STAGES + ["retries", "lengthscale", "noise"]}
+    while len(X) < budget:
+        # ranks are recomputed from all observations every iteration; best gets the highest rank
+        Y_fit = torch.from_numpy(rankdata(Y.numpy(), axis=0)) if rank else Y
         torch.manual_seed(seed)  # re-seed before every fit and every acquisition optimisation
-        gp = SingleTaskGP(X, Y, input_transform=Normalize(d, bounds=bounds))
+        gp = SingleTaskGP(X, Y_fit, likelihood=likelihood(), input_transform=Normalize(d, bounds=bounds))
         fit_gpytorch_mll(ExactMarginalLogLikelihood(gp.likelihood, gp))
         torch.manual_seed(seed)
-        acq = acq_class(gp, best_f=Y.max())
+        acq = acq_class(gp, best_f=Y_fit.max())
         with warnings.catch_warnings(record=True) as caught:  # scipy "ABNORMAL" retries are data, not noise
             warnings.simplefilter("always")
             x_next, acq_value = optimize_acqf(acq, bounds, q=1, num_restarts=10, raw_samples=256)
@@ -64,6 +80,8 @@ def run_bo(f, seed, acq_class, d=2):
         log["acq"].append(acq_value.item())
         log["proposal"].append(x_next.squeeze(0).numpy().copy())
         log["retries"].append(sum("Trying again" in str(w.message) for w in caught))
+        log["lengthscale"].append(gp.covar_module.lengthscale.detach().numpy().ravel().copy())
+        log["noise"].append(gp.likelihood.noise.item())
         X = torch.cat([X, x_next])
         Y = torch.cat([Y, torch.tensor([[-f(x_next)]], dtype=torch.double)])
     log["X"] = X.numpy()

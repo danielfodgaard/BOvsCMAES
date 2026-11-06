@@ -59,17 +59,18 @@ def log_gap(best, ref_best):
     return float(np.log10(max(best, tiny)) - np.log10(max(ref_best, tiny)))
 
 
-def summarise_gaps(rows, group, key="gap"):
+def summarise_gaps(rows, group, key="gap", ref=None):
     """One row per group (e.g. ("a", "b") or ("acq", "a", "b")): median and max |gap| over seeds.
 
-    ref_range is the null band: the max - min over seeds of log10 best f on the reference (a = 1, b = 0)
-    within the same non-(a, b) group. A gap inside it is indistinguishable from seed noise.
+    ref_range is the null band: the max - min over seeds of log10 best f on the reference (ref, default
+    a = 1, b = 0) within the same group on the other keys. A gap inside it is indistinguishable from seed noise.
     """
+    ref = ref or {"a": 1, "b": 0}
     out = []
     for g in sorted({tuple(r[k] for k in group) for r in rows}):
         rs = [r for r in rows if tuple(r[k] for k in group) == g]
-        same_arm = lambda r: all(r[k] == v for k, v in zip(group, g) if k not in ("a", "b"))
-        refs = [np.log10(r[key.replace("gap", "best_f")]) for r in rows if r["a"] == 1 and r["b"] == 0 and same_arm(r)]
+        same_arm = lambda r: all(r[k] == v for k, v in zip(group, g) if k not in ref)
+        refs = [np.log10(r[key.replace("gap", "best_f")]) for r in rows if all(r[k] == v for k, v in ref.items()) and same_arm(r)]
         out.append({**dict(zip(group, g)), "arm": key, "gap_median": float(np.median([r[key] for r in rs])),
                     "gap_max_abs": float(np.max(np.abs([r[key] for r in rs]))), "ref_range": float(np.ptp(refs))})
     return out
@@ -116,7 +117,7 @@ def plot_best_so_far(curve_rows, path, col, line, row=None, ref=None, label=None
     axes[0, 0].legend(frameon=False)
     fig.supxlabel("evaluations")
     fig.supylabel("best-so-far untransformed f, median over seeds")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.02, 0.02, 1, 1))  # tight_layout ignores the sup-labels; reserve a margin so they clear the ticks
     fig.savefig(path, dpi=150)
 
 
