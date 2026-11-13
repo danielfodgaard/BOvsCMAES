@@ -1,0 +1,12 @@
+.idea/
+project_outline.md
+__pycache__/
+results/surprises.md
+# LaTeX build files
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+# notes and write-ups stay local; results/ holds only figures and CSVs
+results/**/*.md

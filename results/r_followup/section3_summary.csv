@@ -1,0 +1,5 @@
+method,transform,median_vs_default_same_g,seeds_better,seeds,p
+bo_postinc,f^1,0.12370690350435304,3,10,0.845703125
+bo_postinc,log f,-0.90929406179133,9,10,0.005859375
+bo_bigbox,f^1,0.4677461216373945,1,10,0.005859375
+bo_bigbox,log f,0.5675784679703924,2,10,0.048828125

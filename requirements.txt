@@ -1,0 +1,8 @@
+numpy==2.5.4
+scipy==1.18.1
+matplotlib==3.11.2
+torch==2.14.1
+gpytorch==1.15.2
+linear_operator==0.6.1
+botorch==0.18.1
+cma==4.5.0
